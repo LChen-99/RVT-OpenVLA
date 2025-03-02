@@ -155,7 +155,8 @@ def load_agent(
                 **mvt_cfg,
             )
 
-            agent = rvt_agent.RVTAgent(
+            agent = rvt_agent.OpenVLAAgent(
+            # agent = rvt_agent.RVTAgent(
                 network=rvt.to(device),
                 image_resolution=[IMAGE_SIZE, IMAGE_SIZE],
                 add_lang=mvt_cfg.add_lang,
@@ -343,7 +344,7 @@ def eval(
                 s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name
             ][0]
         else:
-            task_score = "unknown"
+            task_score = 0
 
         print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
 
@@ -362,17 +363,21 @@ def eval(
                     video = deepcopy(summary.value)
                     video = np.transpose(video, (0, 2, 3, 1))
                     video = video[:, :, :, ::-1]
-                    if task_rewards[video_cnt] > 99:
-                        video_path = os.path.join(
-                            record_folder,
-                            f"{task_name}_success_{video_success_cnt}.mp4",
-                        )
-                        video_success_cnt += 1
-                    else:
-                        video_path = os.path.join(
-                            record_folder, f"{task_name}_fail_{video_fail_cnt}.mp4"
-                        )
-                        video_fail_cnt += 1
+                    video_path = os.path.join(
+                        record_folder,
+                        f"{task_name}_{video_cnt}.mp4",
+                    )
+                    # if task_rewards[video_cnt] > 99:
+                    #     video_path = os.path.join(
+                    #         record_folder,
+                    #         f"{task_name}_success_{video_success_cnt}.mp4",
+                    #     )
+                    #     video_success_cnt += 1
+                    # else:
+                    #     video_path = os.path.join(
+                    #         record_folder, f"{task_name}_fail_{video_fail_cnt}.mp4"
+                    #     )
+                    #     video_fail_cnt += 1
                     video_cnt += 1
                     os.makedirs(video_image_folder, exist_ok=True)
                     for idx in range(len(video) - 10):

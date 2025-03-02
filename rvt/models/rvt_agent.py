@@ -26,7 +26,8 @@ from peract_colab.arm.optim.lamb import Lamb
 from yarr.agents.agent import ActResult
 from rvt.utils.dataset import _clip_encode_text
 from rvt.utils.lr_sched_utils import GradualWarmupScheduler
-
+from transformers import AutoModelForVision2Seq, AutoProcessor
+from PIL import Image
 
 def eval_con(gt, pred):
     assert gt.shape == pred.shape, print(f"{gt.shape} {pred.shape}")
@@ -785,7 +786,8 @@ class RVTAgent:
 
         proprio = arm_utils.stack_on_channel(observation["low_dim_state"])
 
-        obs, pcd = peract_utils._preprocess_inputs(observation, self.cameras)
+        obs, pcd = peract_utils._preprocess_inputs(observation, self.cameras, False)  # len(obs) 4    len(obs[0])   2(第一个是RGB图片，第二个是深度图)    obs[0][0].shape torch.Size([1, 3, 128, 128])
+        
         pc, img_feat = rvt_utils.get_pc_img_feat(
             obs,
             pcd,
@@ -813,7 +815,7 @@ class RVTAgent:
         h = w = self._net_mod.img_size
         dyn_cam_info = None
 
-        out = self._network(
+        out = self._network( # dict_keys(['trans', 'wpt_local1', 'rev_trans', 'mvt2'])   out['trans'].shape torch.Size([1, 3, 224, 224]) out['wpt_local1'].shape torch.Size([1, 3])
             pc=pc,
             img_feat=img_feat,
             proprio=proprio,
@@ -823,15 +825,15 @@ class RVTAgent:
         _, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
             out, dims=(bs, nc, h, w), only_pred=True, get_q_trans=False
         )
-        pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(
+        pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(  # pred_rot_quat array([[-5.27160646e-17,  9.91444861e-01, -5.27160646e-17, 1.30526192e-01]]) pred_grip tensor([[1]], device='cuda:0') pred_wpt tensor([[ 0.2787, -0.0061,  1.4722]], device='cuda:0')            
             out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
         )
 
         continuous_action = np.concatenate(
             (
-                pred_wpt[0].cpu().numpy(),
-                pred_rot_quat[0],
-                pred_grip[0].cpu().numpy(),
+                pred_wpt[0].cpu().numpy(), # tensor([-0.0372, -0.0329,  1.5470], device='cuda:0')
+                pred_rot_quat[0], # array([-9.76296007e-01,  2.16439614e-01, -1.32531040e-17,  5.97808890e-17])
+                pred_grip[0].cpu().numpy(), # array([1])
                 pred_coll[0].cpu().numpy(),
             )
         )
@@ -855,6 +857,699 @@ class RVTAgent:
             )
         else:
             return ActResult(continuous_action)
+
+    def get_pred(
+        self,
+        out,
+        rot_q,
+        grip_q,
+        collision_q,
+        y_q,
+        rev_trans,
+        dyn_cam_info,
+    ):
+        if self.stage_two:
+            assert y_q is None
+            mvt1_or_mvt2 = False
+        else:
+            mvt1_or_mvt2 = True
+
+        pred_wpt_local = self._net_mod.get_wpt(
+            out, mvt1_or_mvt2, dyn_cam_info, y_q
+        )
+
+        pred_wpt = []
+        for _pred_wpt_local, _rev_trans in zip(pred_wpt_local, rev_trans):
+            pred_wpt.append(_rev_trans(_pred_wpt_local))
+        pred_wpt = torch.cat([x.unsqueeze(0) for x in pred_wpt])
+
+        pred_rot = torch.cat(
+            (
+                rot_q[
+                    :,
+                    0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+                rot_q[
+                    :,
+                    1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+                rot_q[
+                    :,
+                    2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                ].argmax(1, keepdim=True),
+            ),
+            dim=-1,
+        )
+        pred_rot_quat = aug_utils.discrete_euler_to_quaternion(
+            pred_rot.cpu(), self._rotation_resolution
+        )
+        pred_grip = grip_q.argmax(1, keepdim=True)
+        pred_coll = collision_q.argmax(1, keepdim=True)
+
+        return pred_wpt, pred_rot_quat, pred_grip, pred_coll
+
+    @torch.no_grad()
+    def get_action_trans(
+        self,
+        wpt_local,
+        pts,
+        out,
+        dyn_cam_info,
+        dims,
+    ):
+        bs, nc, h, w = dims
+        wpt_img = self._net_mod.get_pt_loc_on_img(
+            wpt_local.unsqueeze(1),
+            mvt1_or_mvt2=True,
+            dyn_cam_info=dyn_cam_info,
+            out=None
+        )
+        assert wpt_img.shape[1] == 1
+        if self.stage_two:
+            wpt_img2 = self._net_mod.get_pt_loc_on_img(
+                wpt_local.unsqueeze(1),
+                mvt1_or_mvt2=False,
+                dyn_cam_info=dyn_cam_info,
+                out=out,
+            )
+            assert wpt_img2.shape[1] == 1
+
+            # (bs, 1, 2 * num_img, 2)
+            wpt_img = torch.cat((wpt_img, wpt_img2), dim=-2)
+            nc = nc * 2
+
+        # (bs, num_img, 2)
+        wpt_img = wpt_img.squeeze(1)
+
+        action_trans = mvt_utils.generate_hm_from_pt(
+            wpt_img.reshape(-1, 2),
+            (h, w),
+            sigma=self.gt_hm_sigma,
+            thres_sigma_times=3,
+        )
+        action_trans = action_trans.view(bs, nc, h * w).transpose(1, 2).clone()
+
+        return action_trans
+
+    def reset(self):
+        pass
+
+    def eval(self):
+        self._network.eval()
+
+    def train(self):
+        self._network.train()
+
+
+
+class GenerateConfig:
+    pretrained_checkpoint: str = "/home/gpu/data/openvla_rlbench_80000_step_sample_step_2/adapter_weights/80000_step"     # Pretrained checkpoint path
+    # pretrained_checkpoint: str = "/home/gpu/data/openvla-7b"
+    # pretrained_checkpoint: str = "/home/gpu/openvla/cpkg/20000_step/adapter_weights/openvla-7b+rlbench_dataset+b4+lr-0.0005+lora-r32+dropout-0.0--image_aug" 
+    
+
+class OpenVLAAgent:
+    def __init__(
+        self,
+        network: nn.Module,
+        num_rotation_classes: int,
+        stage_two: bool,
+        add_lang: bool,
+        amp: bool,
+        bnb: bool,
+        move_pc_in_bound: bool,
+        lr: float = 0.0001,
+        lr_cos_dec: bool = False,
+        cos_dec_max_step: int = 60000,
+        warmup_steps: int = 0,
+        image_resolution: list = None,
+        lambda_weight_l2: float = 0.0,
+        transform_augmentation: bool = True,
+        transform_augmentation_xyz: list = [0.1, 0.1, 0.1],
+        transform_augmentation_rpy: list = [0.0, 0.0, 20.0],
+        place_with_mean: bool = True,
+        transform_augmentation_rot_resolution: int = 5,
+        optimizer_type: str = "lamb",
+        gt_hm_sigma: float = 1.5,
+        img_aug: bool = False,
+        add_rgc_loss: bool = False,
+        scene_bounds: list = peract_utils.SCENE_BOUNDS,
+        cameras: list = peract_utils.CAMERAS,
+        rot_ver: int = 0,
+        rot_x_y_aug: int = 2,
+        log_dir="",
+    ):
+        """
+        :param gt_hm_sigma: the std of the groundtruth hm, currently for for
+            2d, if -1 then only single point is considered
+        :type gt_hm_sigma: float
+        :param rot_ver: version of the rotation prediction network
+            Either:
+                0: same as peract, independent discrete xyz predictions
+                1: xyz prediction dependent on one another
+        :param rot_x_y_aug: only applicable when rot_ver is 1, it specifies how
+            much error we should add to groundtruth rotation while training
+        :param log_dir: a folder location for saving some intermediate data
+        """
+        
+        self._network = network
+        self._num_rotation_classes = num_rotation_classes
+        self._rotation_resolution = 360 / self._num_rotation_classes
+        self._lr = lr
+        self._image_resolution = image_resolution
+        self._lambda_weight_l2 = lambda_weight_l2
+        self._transform_augmentation = transform_augmentation
+        self._place_with_mean = place_with_mean
+        self._transform_augmentation_xyz = torch.from_numpy(
+            np.array(transform_augmentation_xyz)
+        )
+        self._transform_augmentation_rpy = transform_augmentation_rpy
+        self._transform_augmentation_rot_resolution = (
+            transform_augmentation_rot_resolution
+        )
+        self._optimizer_type = optimizer_type
+        self.gt_hm_sigma = gt_hm_sigma
+        self.img_aug = img_aug
+        self.add_rgc_loss = add_rgc_loss
+        self.amp = amp
+        self.bnb = bnb
+        self.stage_two = stage_two
+        self.add_lang = add_lang
+        self.log_dir = log_dir
+        self.warmup_steps = warmup_steps
+        self.lr_cos_dec = lr_cos_dec
+        self.cos_dec_max_step = cos_dec_max_step
+        self.scene_bounds = scene_bounds
+        self.cameras = cameras
+        self.move_pc_in_bound = move_pc_in_bound
+        self.rot_ver = rot_ver
+        self.rot_x_y_aug = rot_x_y_aug
+
+        self._cross_entropy_loss = nn.CrossEntropyLoss(reduction="none")
+        if isinstance(self._network, DistributedDataParallel):
+            self._net_mod = self._network.module
+        else:
+            self._net_mod = self._network
+
+        self.num_all_rot = self._num_rotation_classes * 3
+
+        self.scaler = GradScaler(enabled=self.amp)
+        self.cfg = GenerateConfig()
+        self.processor = AutoProcessor.from_pretrained(self.cfg.pretrained_checkpoint, trust_remote_code=True)
+        self.vla = AutoModelForVision2Seq.from_pretrained(
+                    self.cfg.pretrained_checkpoint, 
+                    
+                    # attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+                    torch_dtype=torch.bfloat16, 
+                    low_cpu_mem_usage=True, 
+                    trust_remote_code=True
+                ).to("cuda:0")
+        
+
+    def build(self, training: bool, device: torch.device = None):
+        self._training = training
+        self._device = device
+
+        if self._optimizer_type == "lamb":
+            if self.bnb:
+                print("Using 8-Bit Optimizer")
+                self._optimizer = bnb.optim.LAMB(
+                    self._network.parameters(),
+                    lr=self._lr,
+                    weight_decay=self._lambda_weight_l2,
+                    betas=(0.9, 0.999),
+                )
+            else:
+                # From: https://github.com/cybertronai/pytorch-lamb/blob/master/pytorch_lamb/lamb.py
+                self._optimizer = Lamb(
+                    self._network.parameters(),
+                    lr=self._lr,
+                    weight_decay=self._lambda_weight_l2,
+                    betas=(0.9, 0.999),
+                    adam=False,
+                )
+        elif self._optimizer_type == "adam":
+            self._optimizer = torch.optim.Adam(
+                self._network.parameters(),
+                lr=self._lr,
+                weight_decay=self._lambda_weight_l2,
+            )
+        else:
+            raise Exception("Unknown optimizer")
+
+        if self.lr_cos_dec:
+            after_scheduler = CosineAnnealingLR(
+                self._optimizer,
+                T_max=self.cos_dec_max_step,
+                eta_min=self._lr / 100,  # mininum lr
+            )
+        else:
+            after_scheduler = None
+        self._lr_sched = GradualWarmupScheduler(
+            self._optimizer,
+            multiplier=1,
+            total_epoch=self.warmup_steps,
+            after_scheduler=after_scheduler,
+        )
+
+    def load_clip(self):
+        self.clip_model, self.clip_preprocess = clip.load("RN50", device=self._device)
+        self.clip_model.eval()
+
+    def unload_clip(self):
+        del self.clip_model
+        del self.clip_preprocess
+        with torch.cuda.device(self._device):
+            torch.cuda.empty_cache()
+
+    # copied from per-act and removed the translation part
+    def _get_one_hot_expert_actions(
+        self,
+        batch_size,
+        action_rot,
+        action_grip,
+        action_ignore_collisions,
+        device,
+    ):
+        """_get_one_hot_expert_actions.
+
+        :param batch_size: int
+        :param action_rot: np.array of shape (bs, 4), quternion xyzw format
+        :param action_grip: torch.tensor of shape (bs)
+        :param action_ignore_collisions: torch.tensor of shape (bs)
+        :param device:
+        """
+        bs = batch_size
+        assert action_rot.shape == (bs, 4)
+        assert action_grip.shape == (bs,), (action_grip, bs)
+
+        action_rot_x_one_hot = torch.zeros(
+            (bs, self._num_rotation_classes), dtype=int, device=device
+        )
+        action_rot_y_one_hot = torch.zeros(
+            (bs, self._num_rotation_classes), dtype=int, device=device
+        )
+        action_rot_z_one_hot = torch.zeros(
+            (bs, self._num_rotation_classes), dtype=int, device=device
+        )
+        action_grip_one_hot = torch.zeros((bs, 2), dtype=int, device=device)
+        action_collision_one_hot = torch.zeros((bs, 2), dtype=int, device=device)
+
+        # fill one-hots
+        for b in range(bs):
+            gt_rot = action_rot[b]
+            gt_rot = aug_utils.quaternion_to_discrete_euler(
+                gt_rot, self._rotation_resolution
+            )
+            action_rot_x_one_hot[b, gt_rot[0]] = 1
+            action_rot_y_one_hot[b, gt_rot[1]] = 1
+            action_rot_z_one_hot[b, gt_rot[2]] = 1
+
+            # grip
+            gt_grip = action_grip[b]
+            action_grip_one_hot[b, gt_grip] = 1
+
+            # ignore collision
+            gt_ignore_collisions = action_ignore_collisions[b, :]
+            action_collision_one_hot[b, gt_ignore_collisions[0]] = 1
+
+        return (
+            action_rot_x_one_hot,
+            action_rot_y_one_hot,
+            action_rot_z_one_hot,
+            action_grip_one_hot,
+            action_collision_one_hot,
+        )
+
+    def get_q(self, out, dims, only_pred=False, get_q_trans=True):
+        """
+        :param out: output of mvt
+        :param dims: tensor dimensions (bs, nc, h, w)
+        :param only_pred: some speedupds if the q values are meant only for
+            prediction
+        :return: tuple of trans_q, rot_q, grip_q and coll_q that is used for
+            training and preduction
+        """
+        bs, nc, h, w = dims
+        assert isinstance(only_pred, bool)
+
+        if get_q_trans:
+            pts = None
+            # (bs, h*w, nc)
+            q_trans = out["trans"].view(bs, nc, h * w).transpose(1, 2)
+            if not only_pred:
+                q_trans = q_trans.clone()
+
+            # if two stages, we concatenate the q_trans, and replace all other
+            # q
+            if self.stage_two:
+                out = out["mvt2"]
+                q_trans2 = out["trans"].view(bs, nc, h * w).transpose(1, 2)
+                if not only_pred:
+                    q_trans2 = q_trans2.clone()
+                q_trans = torch.cat((q_trans, q_trans2), dim=2)
+        else:
+            pts = None
+            q_trans = None
+            if self.stage_two:
+                out = out["mvt2"]
+
+        if self.rot_ver == 0:
+            # (bs, 218)
+            rot_q = out["feat"].view(bs, -1)[:, 0 : self.num_all_rot]
+            grip_q = out["feat"].view(bs, -1)[:, self.num_all_rot : self.num_all_rot + 2]
+            # (bs, 2)
+            collision_q = out["feat"].view(bs, -1)[
+                :, self.num_all_rot + 2 : self.num_all_rot + 4
+            ]
+        elif self.rot_ver == 1:
+            rot_q = torch.cat((out["feat_x"], out["feat_y"], out["feat_z"]),
+                              dim=-1).view(bs, -1)
+            grip_q = out["feat_ex_rot"].view(bs, -1)[:, :2]
+            collision_q = out["feat_ex_rot"].view(bs, -1)[:, 2:]
+        else:
+            assert False
+
+        y_q = None
+
+        return q_trans, rot_q, grip_q, collision_q, y_q, pts
+
+    def update(
+        self,
+        step: int,
+        replay_sample: dict,
+        backprop: bool = True,
+        eval_log: bool = False,
+        reset_log: bool = False,
+    ) -> dict:
+        assert replay_sample["rot_grip_action_indicies"].shape[1:] == (1, 4)
+        assert replay_sample["ignore_collisions"].shape[1:] == (1, 1)
+        assert replay_sample["gripper_pose"].shape[1:] == (1, 7)
+        assert replay_sample["lang_goal_embs"].shape[1:] == (1, 77, 512)
+        assert replay_sample["low_dim_state"].shape[1:] == (
+            1,
+            self._net_mod.proprio_dim,
+        )
+
+        # sample
+        action_rot_grip = replay_sample["rot_grip_action_indicies"][
+            :, -1
+        ].int()  # (b, 4) of int
+        action_ignore_collisions = replay_sample["ignore_collisions"][
+            :, -1
+        ].int()  # (b, 1) of int
+        action_gripper_pose = replay_sample["gripper_pose"][:, -1]  # (b, 7)
+        action_trans_con = action_gripper_pose[:, 0:3]  # (b, 3)
+        # rotation in quaternion xyzw
+        action_rot = action_gripper_pose[:, 3:7]  # (b, 4)
+        action_grip = action_rot_grip[:, -1]  # (b,)
+        lang_goal_embs = replay_sample["lang_goal_embs"][:, -1].float()
+        tasks = replay_sample["tasks"]
+
+        proprio = arm_utils.stack_on_channel(replay_sample["low_dim_state"])  # (b, 4)
+        return_out = {}
+
+        obs, pcd = peract_utils._preprocess_inputs(replay_sample, self.cameras)
+
+        with torch.no_grad():
+            pc, img_feat = rvt_utils.get_pc_img_feat(
+                obs,
+                pcd,
+            )
+
+            if self._transform_augmentation and backprop:
+                action_trans_con, action_rot, pc = apply_se3_aug_con(
+                    pcd=pc,
+                    action_gripper_pose=action_gripper_pose,
+                    bounds=torch.tensor(self.scene_bounds),
+                    trans_aug_range=torch.tensor(self._transform_augmentation_xyz),
+                    rot_aug_range=torch.tensor(self._transform_augmentation_rpy),
+                )
+                action_trans_con = torch.tensor(action_trans_con).to(pc.device)
+                action_rot = torch.tensor(action_rot).to(pc.device)
+
+            # TODO: vectorize
+            action_rot = action_rot.cpu().numpy()
+            for i, _action_rot in enumerate(action_rot):
+                _action_rot = aug_utils.normalize_quaternion(_action_rot)
+                if _action_rot[-1] < 0:
+                    _action_rot = -_action_rot
+                action_rot[i] = _action_rot
+
+            pc, img_feat = rvt_utils.move_pc_in_bound(
+                pc, img_feat, self.scene_bounds, no_op=not self.move_pc_in_bound
+            )
+            wpt = [x[:3] for x in action_trans_con]
+
+            wpt_local = []
+            rev_trans = []
+            for _pc, _wpt in zip(pc, wpt):
+                a, b = mvt_utils.place_pc_in_cube(
+                    _pc,
+                    _wpt,
+                    with_mean_or_bounds=self._place_with_mean,
+                    scene_bounds=None if self._place_with_mean else self.scene_bounds,
+                )
+                wpt_local.append(a.unsqueeze(0))
+                rev_trans.append(b)
+
+            wpt_local = torch.cat(wpt_local, axis=0)
+
+            # TODO: Vectorize
+            pc = [
+                mvt_utils.place_pc_in_cube(
+                    _pc,
+                    with_mean_or_bounds=self._place_with_mean,
+                    scene_bounds=None if self._place_with_mean else self.scene_bounds,
+                )[0]
+                for _pc in pc
+            ]
+
+            bs = len(pc)
+            nc = self._net_mod.num_img
+            h = w = self._net_mod.img_size
+
+            if backprop and (self.img_aug != 0):
+                img_aug = self.img_aug
+            else:
+                img_aug = 0
+
+            dyn_cam_info = None
+
+        with autocast(enabled=self.amp):
+            (
+                action_rot_x_one_hot,
+                action_rot_y_one_hot,
+                action_rot_z_one_hot,
+                action_grip_one_hot,  # (bs, 2)
+                action_collision_one_hot,  # (bs, 2)
+            ) = self._get_one_hot_expert_actions(
+                bs, action_rot, action_grip, action_ignore_collisions, device=self._device
+            )
+
+            if self.rot_ver == 1:
+                rot_x_y = torch.cat(
+                    [
+                        action_rot_x_one_hot.argmax(dim=-1, keepdim=True),
+                        action_rot_y_one_hot.argmax(dim=-1, keepdim=True),
+                    ],
+                    dim=-1,
+                )
+                if self.rot_x_y_aug != 0:
+                    # add random interger between -rot_x_y_aug and rot_x_y_aug to rot_x_y
+                    rot_x_y += torch.randint(
+                        -self.rot_x_y_aug, self.rot_x_y_aug, size=rot_x_y.shape
+                    ).to(rot_x_y.device)
+                    rot_x_y %= self._num_rotation_classes
+
+            out = self._network(
+                pc=pc,
+                img_feat=img_feat,
+                proprio=proprio,
+                lang_emb=lang_goal_embs,
+                img_aug=img_aug,
+                wpt_local=wpt_local if self._network.training else None,
+                rot_x_y=rot_x_y if self.rot_ver == 1 else None,
+            )
+
+            q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
+                out, dims=(bs, nc, h, w)
+            )
+
+            action_trans = self.get_action_trans(
+                wpt_local, pts, out, dyn_cam_info, dims=(bs, nc, h, w)
+            )
+
+        loss_log = {}
+        if backprop:
+            with autocast(enabled=self.amp):
+                # cross-entropy loss
+                trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()
+                rot_loss_x = rot_loss_y = rot_loss_z = 0.0
+                grip_loss = 0.0
+                collision_loss = 0.0
+                if self.add_rgc_loss:
+                    rot_loss_x = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                        ],
+                        action_rot_x_one_hot.argmax(-1),
+                    ).mean()
+
+                    rot_loss_y = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                        ],
+                        action_rot_y_one_hot.argmax(-1),
+                    ).mean()
+
+                    rot_loss_z = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                        ],
+                        action_rot_z_one_hot.argmax(-1),
+                    ).mean()
+
+                    grip_loss = self._cross_entropy_loss(
+                        grip_q,
+                        action_grip_one_hot.argmax(-1),
+                    ).mean()
+
+                    collision_loss = self._cross_entropy_loss(
+                        collision_q, action_collision_one_hot.argmax(-1)
+                    ).mean()
+
+                total_loss = (
+                    trans_loss
+                    + rot_loss_x
+                    + rot_loss_y
+                    + rot_loss_z
+                    + grip_loss
+                    + collision_loss
+                )
+
+            self._optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self._optimizer)
+            self.scaler.update()
+            self._lr_sched.step()
+
+            loss_log = {
+                "total_loss": total_loss.item(),
+                "trans_loss": trans_loss.item(),
+                "rot_loss_x": rot_loss_x.item(),
+                "rot_loss_y": rot_loss_y.item(),
+                "rot_loss_z": rot_loss_z.item(),
+                "grip_loss": grip_loss.item(),
+                "collision_loss": collision_loss.item(),
+                "lr": self._optimizer.param_groups[0]["lr"],
+            }
+            manage_loss_log(self, loss_log, reset_log=reset_log)
+            return_out.update(loss_log)
+
+        if eval_log:
+            with torch.no_grad():
+                wpt = torch.cat([x.unsqueeze(0) for x in wpt])
+                pred_wpt, pred_rot_quat, _, _ = self.get_pred(
+                    out,
+                    rot_q,
+                    grip_q,
+                    collision_q,
+                    y_q,
+                    rev_trans,
+                    dyn_cam_info=dyn_cam_info,
+                )
+
+                return_log = manage_eval_log(
+                    self=self,
+                    tasks=tasks,
+                    wpt=wpt,
+                    pred_wpt=pred_wpt,
+                    action_rot=action_rot,
+                    pred_rot_quat=pred_rot_quat,
+                    action_grip_one_hot=action_grip_one_hot,
+                    grip_q=grip_q,
+                    action_collision_one_hot=action_collision_one_hot,
+                    collision_q=collision_q,
+                    reset_log=reset_log,
+                )
+
+                return_out.update(return_log)
+
+        return return_out
+
+
+
+    def euler_to_quaternion(self, euler_angles):
+        """
+        将欧拉角 (roll, pitch, yaw) 转换为四元数 (w, x, y, z)。
+        :param roll: 绕 X 轴的旋转角度 (弧度)
+        :param pitch: 绕 Y 轴的旋转角度 (弧度)
+        :param yaw: 绕 Z 轴的旋转角度 (弧度)
+        :return: 四元数 (w, x, y, z)
+        """
+        # 计算中间变量
+        roll, pitch, yaw = euler_angles
+        cy = np.cos(yaw * 0.5)
+        sy = np.sin(yaw * 0.5)
+        cp = np.cos(pitch * 0.5)
+        sp = np.sin(pitch * 0.5)
+        cr = np.cos(roll * 0.5)
+        sr = np.sin(roll * 0.5)
+        
+        # 计算四元数
+        w = cy * cp * cr + sy * sp * sr
+        x = sy * sp * cr - cy * cp * sr
+        y = sy * cp * cr + cy * sp * sr
+        z = cy * sp * cr - sy * cp * sr
+        
+        return w, x, y, z
+
+    @torch.no_grad()
+    def act(
+        self, step: int, observation: dict, deterministic=True, pred_distri=False
+    ) -> ActResult:
+
+
+        language_instruction = observation.get('language_instruction')
+        obs, pcd = peract_utils._preprocess_inputs(observation, self.cameras, False)
+
+
+        # Load Processor & VLA
+        tensor = obs[0][0].cpu()
+        tensor = tensor.squeeze(0)
+        tensor = tensor.permute(1, 2, 0)  
+        tensor = tensor.clamp(0, 255).to(torch.uint8)
+        image = Image.fromarray(tensor.numpy()).convert("RGB")
+        language_instruction_bytes = language_instruction[0].item()
+
+        language_instruction_str = language_instruction_bytes.decode('utf-8')
+        prompt = f"In: What action should the robot take to {language_instruction_str}?\nOut:"
+
+        # Predict Action (7-DoF; un-normalize)
+        inputs = self.processor(prompt, image).to("cuda:0", dtype=torch.bfloat16)
+        action = self.vla.predict_action(**inputs, unnorm_key="rlbench_dataset", do_sample=False)
+        euler_angles = action[3:6]
+        pos = action[0:3]
+        quaternion = Rotation.from_euler('xyz', euler_angles, degrees=False).as_quat()
+        grip = action[-1]
+        grip = np.array([1]) if grip > 0.8 else np.array([0])
+        continuous_action = np.concatenate(
+            (
+                pos,
+                quaternion,
+                grip,
+                np.array([0]),
+            )
+        )
+        return ActResult(continuous_action)
+
+
+
+
 
     def get_pred(
         self,

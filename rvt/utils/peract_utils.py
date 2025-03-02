@@ -12,7 +12,7 @@ from rvt.utils.lr_sched_utils import GradualWarmupScheduler
 
 # Contants
 # TODO: Unclear about the best way to handle them
-CAMERAS = ["front", "left_shoulder", "right_shoulder", "wrist"]
+CAMERAS = ["overhead", "front", "left_shoulder", "right_shoulder", "wrist"]
 SCENE_BOUNDS = [
     -0.3,
     -0.5,
@@ -38,13 +38,13 @@ def _norm_rgb(x):
     return (x.float() / 255.0) * 2.0 - 1.0
 
 
-def _preprocess_inputs(replay_sample, cameras):
+def _preprocess_inputs(replay_sample, cameras, norm=True):
     obs, pcds = [], []
     for n in cameras:
         rgb = stack_on_channel(replay_sample["%s_rgb" % n])
         pcd = stack_on_channel(replay_sample["%s_point_cloud" % n])
-
-        rgb = _norm_rgb(rgb)
+        if norm:
+            rgb = _norm_rgb(rgb)
 
         obs.append(
             [rgb, pcd]

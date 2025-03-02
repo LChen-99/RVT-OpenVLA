@@ -12,8 +12,8 @@ import signal
 from datetime import datetime
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
-
+# from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import rvt.utils.peract_utils as peract_utils
@@ -229,24 +229,31 @@ def get_eval_parser():
 
 
 RLBENCH_TASKS = [
-    "put_item_in_drawer",
-    "reach_and_drag",
-    "turn_tap",
-    "slide_block_to_color_target",
-    "open_drawer",
-    "put_groceries_in_cupboard",
-    "place_shape_in_shape_sorter",
-    "put_money_in_safe",
-    "push_buttons",
-    "close_jar",
-    "stack_blocks",
-    "place_cups",
-    "place_wine_at_rack_location",
-    "light_bulb_in",
-    "sweep_to_dustpan_of_size",
-    "insert_onto_square_peg",
-    "meat_off_grill",
-    "stack_cups",
+    # "put_item_in_drawer",
+    # "reach_and_drag",
+    # "turn_tap",
+    # "slide_block_to_color_target",
+    # "open_drawer",
+    # "put_groceries_in_cupboard",
+    # "place_shape_in_shape_sorter",
+    # "put_money_in_safe",
+    # "push_buttons",
+    # "close_jar",
+    # "stack_blocks",
+    # "place_cups",
+    # "place_wine_at_rack_location",
+    # "light_bulb_in",
+    # "sweep_to_dustpan_of_size",
+    # "insert_onto_square_peg",
+    # "meat_off_grill",
+    # "stack_cups",
+
+    "close_drawer",
+    "close_fridge",
+    "open_oven",
+    "open_window",
+    "close_laptop_lid",
+    "open_fridge",
 ]
 
 
